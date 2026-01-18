@@ -24,7 +24,7 @@ To build the project, run:
 make
 ```
 
-The server vendors CivetWeb as `src/civetweb.c` and `include/civetweb.h`.
+The server is implemented with a small POSIX socket loop and keeps all data in memory.
 
 ## License
 

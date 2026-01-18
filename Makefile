@@ -1,10 +1,10 @@
 CC=gcc
-CFLAGS=-I include -DNO_SSL -DNO_CGI
+CFLAGS=-I include
 
 all: main
 
-main: src/main.c src/contacts.c src/civetweb.c
-	$(CC) $(CFLAGS) -o main src/main.c src/contacts.c src/civetweb.c -lpthread
+main: src/main.c src/contacts.c
+	$(CC) $(CFLAGS) -o main src/main.c src/contacts.c
 
 clean:
 	rm -f main

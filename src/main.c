@@ -1,14 +1,19 @@
+#include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include "civetweb.h"
+#include <sys/socket.h>
+#include <unistd.h>
 #include "contacts.h"
 
 enum {
+    SERVER_PORT = 8000,
+    MAX_REQUEST = 16384,
     MAX_BODY = 2048,
     MAX_RESPONSE = 65536
 };
@@ -22,44 +27,98 @@ static const char *http_status_text(int status) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 409: return "Conflict";
+        case 413: return "Payload Too Large";
         case 500: return "Internal Server Error";
         default: return "OK";
     }
 }
 
-static void send_json(struct mg_connection *conn, int status, const char *body) {
+static int send_all(int fd, const char *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t sent = send(fd, buf + total, len - total, 0);
+        if (sent <= 0) {
+            return 0;
+        }
+        total += (size_t)sent;
+    }
+    return 1;
+}
+
+static void send_json(int fd, int status, const char *body) {
     const char *text = http_status_text(status);
     size_t len = body ? strlen(body) : 0;
-    mg_printf(conn,
-              "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
-              status, text, len);
+    char header[256];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 %d %s\r\n"
+                              "Content-Type: application/json\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Connection: close\r\n\r\n",
+                              status, text, len);
+    if (header_len > 0) {
+        send_all(fd, header, (size_t)header_len);
+    }
     if (body && len > 0) {
-        mg_write(conn, body, len);
+        send_all(fd, body, len);
     }
 }
 
-static void send_error(struct mg_connection *conn, int status, const char *message) {
+static void send_error(int fd, int status, const char *message) {
     char body[256];
     snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
-    send_json(conn, status, body);
+    send_json(fd, status, body);
 }
 
-static int read_body(struct mg_connection *conn, const struct mg_request_info *ri,
-                     char *buf, size_t buf_size) {
-    long long length = ri->content_length;
-    if (length <= 0 || length >= (long long)buf_size) {
-        return -1;
+static int buf_append(char *buf, size_t *offset, size_t cap, const char *fmt, ...) {
+    if (*offset >= cap) {
+        return 0;
     }
-    size_t total = 0;
-    while (total < (size_t)length) {
-        int nread = mg_read(conn, buf + total, (size_t)length - total);
-        if (nread <= 0) {
-            return -1;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + *offset, cap - *offset, fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= cap - *offset) {
+        return 0;
+    }
+    *offset += (size_t)written;
+    return 1;
+}
+
+static int buf_append_json_string(char *buf, size_t *offset, size_t cap, const char *value) {
+    if (!buf_append(buf, offset, cap, "\"")) {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') {
+            if (!buf_append(buf, offset, cap, "\\%c", c)) return 0;
+        } else if (c == '\b') {
+            if (!buf_append(buf, offset, cap, "\\b")) return 0;
+        } else if (c == '\f') {
+            if (!buf_append(buf, offset, cap, "\\f")) return 0;
+        } else if (c == '\n') {
+            if (!buf_append(buf, offset, cap, "\\n")) return 0;
+        } else if (c == '\r') {
+            if (!buf_append(buf, offset, cap, "\\r")) return 0;
+        } else if (c == '\t') {
+            if (!buf_append(buf, offset, cap, "\\t")) return 0;
+        } else if (c < 0x20) {
+            if (!buf_append(buf, offset, cap, "\\u%04x", c)) return 0;
+        } else {
+            if (!buf_append(buf, offset, cap, "%c", c)) return 0;
         }
-        total += (size_t)nread;
     }
-    buf[total] = '\0';
-    return (int)total;
+    return buf_append(buf, offset, cap, "\"");
+}
+
+static int append_contact_json(char *buf, size_t *offset, size_t cap, const Contact *contact) {
+    if (!buf_append(buf, offset, cap, "{\"id\":%d,\"name\":", contact->id)) return 0;
+    if (!buf_append_json_string(buf, offset, cap, contact->name)) return 0;
+    if (!buf_append(buf, offset, cap, ",\"email\":")) return 0;
+    if (!buf_append_json_string(buf, offset, cap, contact->email)) return 0;
+    if (!buf_append(buf, offset, cap, ",\"phone\":")) return 0;
+    if (!buf_append_json_string(buf, offset, cap, contact->phone)) return 0;
+    return buf_append(buf, offset, cap, "}");
 }
 
 static const char *skip_ws(const char *s) {
@@ -116,9 +175,7 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
                     int value = 0;
                     for (int i = 0; i < 4; i++) {
                         char h = *++p;
-                        if (!h) {
-                            return 0;
-                        }
+                        if (!h) return 0;
                         value <<= 4;
                         if (h >= '0' && h <= '9') value |= (h - '0');
                         else if (h >= 'a' && h <= 'f') value |= (h - 'a' + 10);
@@ -145,71 +202,17 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
     return 1;
 }
 
-static int buf_append(char *buf, size_t *offset, size_t cap, const char *fmt, ...) {
-    if (*offset >= cap) {
-        return 0;
-    }
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buf + *offset, cap - *offset, fmt, args);
-    va_end(args);
-    if (written < 0 || (size_t)written >= cap - *offset) {
-        return 0;
-    }
-    *offset += (size_t)written;
-    return 1;
+static int is_contacts_root(const char *path) {
+    return strcmp(path, "/contacts") == 0 || strcmp(path, "/contacts/") == 0;
 }
 
-static int buf_append_json_string(char *buf, size_t *offset, size_t cap, const char *value) {
-    if (!buf_append(buf, offset, cap, "\"")) {
-        return 0;
-    }
-    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
-        unsigned char c = *p;
-        if (c == '"' || c == '\\') {
-            if (!buf_append(buf, offset, cap, "\\%c", c)) {
-                return 0;
-            }
-        } else if (c == '\b') {
-            if (!buf_append(buf, offset, cap, "\\b")) return 0;
-        } else if (c == '\f') {
-            if (!buf_append(buf, offset, cap, "\\f")) return 0;
-        } else if (c == '\n') {
-            if (!buf_append(buf, offset, cap, "\\n")) return 0;
-        } else if (c == '\r') {
-            if (!buf_append(buf, offset, cap, "\\r")) return 0;
-        } else if (c == '\t') {
-            if (!buf_append(buf, offset, cap, "\\t")) return 0;
-        } else if (c < 0x20) {
-            if (!buf_append(buf, offset, cap, "\\u%04x", c)) return 0;
-        } else {
-            if (!buf_append(buf, offset, cap, "%c", c)) return 0;
-        }
-    }
-    return buf_append(buf, offset, cap, "\"");
-}
-
-static int append_contact_json(char *buf, size_t *offset, size_t cap, const Contact *contact) {
-    if (!buf_append(buf, offset, cap, "{\"id\":%d,\"name\":", contact->id)) return 0;
-    if (!buf_append_json_string(buf, offset, cap, contact->name)) return 0;
-    if (!buf_append(buf, offset, cap, ",\"email\":")) return 0;
-    if (!buf_append_json_string(buf, offset, cap, contact->email)) return 0;
-    if (!buf_append(buf, offset, cap, ",\"phone\":")) return 0;
-    if (!buf_append_json_string(buf, offset, cap, contact->phone)) return 0;
-    return buf_append(buf, offset, cap, "}");
-}
-
-static int is_contacts_root(const char *uri) {
-    return strcmp(uri, "/contacts") == 0 || strcmp(uri, "/contacts/") == 0;
-}
-
-static int parse_contact_id(const char *uri, int *out_id) {
+static int parse_contact_id(const char *path, int *out_id) {
     const char *prefix = "/contacts/";
     size_t prefix_len = strlen(prefix);
-    if (strncmp(uri, prefix, prefix_len) != 0) {
+    if (strncmp(path, prefix, prefix_len) != 0) {
         return 0;
     }
-    const char *id_str = uri + prefix_len;
+    const char *id_str = path + prefix_len;
     if (*id_str == '\0') {
         return 0;
     }
@@ -225,162 +228,260 @@ static int parse_contact_id(const char *uri, int *out_id) {
     return 1;
 }
 
-static int contacts_handler(struct mg_connection *conn, void *cbdata) {
-    (void)cbdata;
-    const struct mg_request_info *ri = mg_get_request_info(conn);
-    const char *method = ri->request_method ? ri->request_method : "";
-    const char *uri = ri->local_uri ? ri->local_uri : (ri->request_uri ? ri->request_uri : "");
+static int parse_content_length(const char *headers) {
+    const char *pos = headers;
+    while (pos && *pos) {
+        const char *line_end = strstr(pos, "\r\n");
+        size_t line_len = line_end ? (size_t)(line_end - pos) : strlen(pos);
+        if (line_len >= 15 && strncasecmp(pos, "Content-Length:", 15) == 0) {
+            const char *value = pos + 15;
+            while (*value == ' ' || *value == '\t') value++;
+            long len = strtol(value, NULL, 10);
+            if (len > INT_MAX) {
+                return -1;
+            }
+            return (int)len;
+        }
+        if (!line_end) {
+            break;
+        }
+        pos = line_end + 2;
+    }
+    return 0;
+}
 
+static int read_request(int fd, char *buffer, size_t buffer_size,
+                        char **out_body, int *out_body_len) {
+    size_t total = 0;
+    buffer[0] = '\0';
+    while (total + 1 < buffer_size) {
+        ssize_t nread = recv(fd, buffer + total, buffer_size - total - 1, 0);
+        if (nread <= 0) {
+            return 0;
+        }
+        total += (size_t)nread;
+        buffer[total] = '\0';
+        if (strstr(buffer, "\r\n\r\n")) {
+            break;
+        }
+    }
+
+    char *header_end = strstr(buffer, "\r\n\r\n");
+    if (!header_end) {
+        return 0;
+    }
+    *header_end = '\0';
+    char *body_start = header_end + 4;
+    int body_len = parse_content_length(buffer);
+    if (body_len < 0) {
+        return 0;
+    }
+    size_t have_body = total - (size_t)(body_start - buffer);
+    if (body_len > 0) {
+        if (body_len >= (int)(buffer_size - 1)) {
+            return -1;
+        }
+        while ((int)have_body < body_len) {
+            ssize_t nread = recv(fd, buffer + total, buffer_size - total - 1, 0);
+            if (nread <= 0) {
+                return 0;
+            }
+            total += (size_t)nread;
+            buffer[total] = '\0';
+            have_body = total - (size_t)(body_start - buffer);
+        }
+        body_start[body_len] = '\0';
+    }
+
+    *out_body = body_start;
+    *out_body_len = body_len;
+    return 1;
+}
+
+static void handle_request(int client_fd, const char *method, const char *path,
+                           const char *body, int body_len) {
     int contact_id = 0;
-    int has_id = parse_contact_id(uri, &contact_id);
-    int is_root = is_contacts_root(uri);
+    int has_id = parse_contact_id(path, &contact_id);
+    int is_root = is_contacts_root(path);
 
     if (!has_id && !is_root) {
-        return 0;
+        send_error(client_fd, 404, "Not found");
+        return;
     }
 
     if (strcmp(method, "GET") == 0 && is_root) {
         char response[MAX_RESPONSE];
         size_t offset = 0;
         if (!buf_append(response, &offset, sizeof(response), "[")) {
-            send_error(conn, 500, "Response too large");
-            return 500;
+            send_error(client_fd, 500, "Response too large");
+            return;
         }
         const Contact *all = contacts_all();
         int count = contacts_count();
         for (int i = 0; i < count; i++) {
             if (i > 0 && !buf_append(response, &offset, sizeof(response), ",")) {
-                send_error(conn, 500, "Response too large");
-                return 500;
+                send_error(client_fd, 500, "Response too large");
+                return;
             }
             if (!append_contact_json(response, &offset, sizeof(response), &all[i])) {
-                send_error(conn, 500, "Response too large");
-                return 500;
+                send_error(client_fd, 500, "Response too large");
+                return;
             }
         }
         if (!buf_append(response, &offset, sizeof(response), "]")) {
-            send_error(conn, 500, "Response too large");
-            return 500;
+            send_error(client_fd, 500, "Response too large");
+            return;
         }
-        send_json(conn, 200, response);
-        return 200;
+        send_json(client_fd, 200, response);
+        return;
     }
 
     if (strcmp(method, "GET") == 0 && has_id) {
         Contact contact;
         if (!contacts_get(contact_id, &contact)) {
-            send_error(conn, 404, "Contact not found");
-            return 404;
+            send_error(client_fd, 404, "Contact not found");
+            return;
         }
         char response[1024];
         size_t offset = 0;
         if (!append_contact_json(response, &offset, sizeof(response), &contact)) {
-            send_error(conn, 500, "Response too large");
-            return 500;
+            send_error(client_fd, 500, "Response too large");
+            return;
         }
-        send_json(conn, 200, response);
-        return 200;
+        send_json(client_fd, 200, response);
+        return;
     }
 
-    if (strcmp(method, "POST") == 0 && is_root) {
-        char body[MAX_BODY];
-        if (read_body(conn, ri, body, sizeof(body)) < 0) {
-            send_error(conn, 400, "Invalid request body");
-            return 400;
+    if ((strcmp(method, "POST") == 0 && is_root) ||
+        (strcmp(method, "PUT") == 0 && has_id)) {
+        if (body_len <= 0 || body_len >= MAX_BODY) {
+            send_error(client_fd, 400, "Invalid request body");
+            return;
         }
         Contact input;
         memset(&input, 0, sizeof(input));
         if (!json_get_string(body, "name", input.name, sizeof(input.name)) ||
             !json_get_string(body, "email", input.email, sizeof(input.email)) ||
             !json_get_string(body, "phone", input.phone, sizeof(input.phone))) {
-            send_error(conn, 400, "Missing or invalid fields");
-            return 400;
+            send_error(client_fd, 400, "Missing or invalid fields");
+            return;
         }
-        Contact created;
-        if (!contacts_create(&input, &created)) {
-            send_error(conn, 409, "Contact list is full");
-            return 409;
-        }
-        char response[1024];
-        size_t offset = 0;
-        if (!append_contact_json(response, &offset, sizeof(response), &created)) {
-            send_error(conn, 500, "Response too large");
-            return 500;
-        }
-        send_json(conn, 201, response);
-        return 201;
-    }
 
-    if (strcmp(method, "PUT") == 0 && has_id) {
-        char body[MAX_BODY];
-        if (read_body(conn, ri, body, sizeof(body)) < 0) {
-            send_error(conn, 400, "Invalid request body");
-            return 400;
+        if (strcmp(method, "POST") == 0) {
+            Contact created;
+            if (!contacts_create(&input, &created)) {
+                send_error(client_fd, 409, "Contact list is full");
+                return;
+            }
+            char response[1024];
+            size_t offset = 0;
+            if (!append_contact_json(response, &offset, sizeof(response), &created)) {
+                send_error(client_fd, 500, "Response too large");
+                return;
+            }
+            send_json(client_fd, 201, response);
+            return;
         }
-        Contact input;
-        memset(&input, 0, sizeof(input));
-        if (!json_get_string(body, "name", input.name, sizeof(input.name)) ||
-            !json_get_string(body, "email", input.email, sizeof(input.email)) ||
-            !json_get_string(body, "phone", input.phone, sizeof(input.phone))) {
-            send_error(conn, 400, "Missing or invalid fields");
-            return 400;
-        }
+
         Contact updated;
         if (!contacts_update(contact_id, &input, &updated)) {
-            send_error(conn, 404, "Contact not found");
-            return 404;
+            send_error(client_fd, 404, "Contact not found");
+            return;
         }
         char response[1024];
         size_t offset = 0;
         if (!append_contact_json(response, &offset, sizeof(response), &updated)) {
-            send_error(conn, 500, "Response too large");
-            return 500;
+            send_error(client_fd, 500, "Response too large");
+            return;
         }
-        send_json(conn, 200, response);
-        return 200;
+        send_json(client_fd, 200, response);
+        return;
     }
 
     if (strcmp(method, "DELETE") == 0 && has_id) {
         if (!contacts_delete(contact_id)) {
-            send_error(conn, 404, "Contact not found");
-            return 404;
+            send_error(client_fd, 404, "Contact not found");
+            return;
         }
-        send_json(conn, 204, "");
-        return 204;
+        send_json(client_fd, 204, "");
+        return;
     }
 
-    send_error(conn, 405, "Method not allowed");
-    return 405;
+    send_error(client_fd, 405, "Method not allowed");
+}
+
+static void handle_client(int client_fd) {
+    char buffer[MAX_REQUEST];
+    char *body = NULL;
+    int body_len = 0;
+    int read_status = read_request(client_fd, buffer, sizeof(buffer), &body, &body_len);
+    if (read_status == -1) {
+        send_error(client_fd, 413, "Payload too large");
+        return;
+    }
+    if (read_status == 0) {
+        send_error(client_fd, 400, "Invalid request");
+        return;
+    }
+
+    char method[8];
+    char path[256];
+    if (sscanf(buffer, "%7s %255s", method, path) != 2) {
+        send_error(client_fd, 400, "Invalid request line");
+        return;
+    }
+
+    handle_request(client_fd, method, path, body, body_len);
 }
 
 int main(void) {
-    const char *options[] = {"listening_ports", "8000", "num_threads", "1", NULL};
-    struct mg_callbacks callbacks;
-    memset(&callbacks, 0, sizeof(callbacks));
-
-    struct mg_context *ctx = mg_start(&callbacks, NULL, options);
-    if (ctx == NULL) {
-        fprintf(stderr, "Failed to start CivetWeb server\n");
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
         return 1;
     }
 
-    mg_set_request_handler(ctx, "/contacts", contacts_handler, NULL);
-    mg_set_request_handler(ctx, "/contacts/", contacts_handler, NULL);
-
-    printf("Starting REST API server on http://localhost:8000\n");
-    printf("Try: curl http://localhost:8000/contacts\n");
-
-    for (;;) {
-        #ifdef _WIN32
-        Sleep(1000);
-        #else
-        struct timespec ts;
-        ts.tv_sec = 1;
-        ts.tv_nsec = 0;
-        nanosleep(&ts, NULL);
-        #endif
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(server_fd);
+        return 1;
     }
 
-    mg_stop(ctx);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(SERVER_PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        return 1;
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        close(server_fd);
+        return 1;
+    }
+
+    printf("Starting REST API server on http://localhost:%d\n", SERVER_PORT);
+    printf("Try: curl http://localhost:%d/contacts\n", SERVER_PORT);
+
+    for (;;) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            break;
+        }
+        handle_client(client_fd);
+        close(client_fd);
+    }
+
+    close(server_fd);
     return 0;
 }
