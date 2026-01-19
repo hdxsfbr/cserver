@@ -1,0 +1,22 @@
+@base=http://localhost:8000
+
+### Create contact
+POST {{base}}/contacts
+Content-Type: application/json
+
+{"name":"linus","email":"linus@example.com","phone":"666-0100"}
+
+### List contacts
+GET {{base}}/contacts
+
+### Get contact by id
+GET {{base}}/contacts/1
+
+### Update contact
+PUT {{base}}/contacts/1
+Content-Type: application/json
+
+{"name":"Ada Lovelace","email":"ada@newmail.com","phone":"555-0199"}
+
+### Delete contact
+DELETE {{base}}/contacts/1
